@@ -35,7 +35,7 @@ int main(int argc, char **argv)
         
     }
 
-    printf("%s", user_agent_hdr);
+    printf("%s\n", user_agent_hdr);
 
 
 
@@ -70,7 +70,7 @@ static void serve_client(int clientfd){
 
     /* forward request to server */
     forward_request(serverfd, &request);
-    if (forward_headers(serverfd, &request) < 0) return;
+    if (forward_request_headers(serverfd, &request) < 0) return;
     printf("Forwarded request to (%s, %s)\n", request.hostname, request.port);
     forward_response(serverfd, clientfd, &request);
     printf("Forwarded response\n");
@@ -117,16 +117,19 @@ static int read_request(int fd_from, request_t * request){
 static void forward_request(int fd_to, request_t * request){
     char buf[MAXLINE];
     sprintf(buf, "%s %s %s\r\n", request->type, request->path, "HTTP/1.0");
+    printf("Processing request: %s %s %s from host %s\n",request->type, request->path, "HTTP/1.0", request->hostname);
     Rio_writen(fd_to, buf, strlen(buf));
     return;
 }
 
-static int forward_headers(int fd_to, request_t * request){
+static int forward_request_headers(int fd_to, request_t * request){
     char buf[MAXLINE];
     char header_key[MAXLINE], header_val[MAXLINE];
     int client_host_header_flag = 0;
 
-     if (Rio_readlineb(&(request->request_rio), buf, MAXLINE) <= 0) return -1;
+    request->enable_compression = 0;
+
+    if (Rio_readlineb(&(request->request_rio), buf, MAXLINE) <= 0) return -1;
 
     while (strcmp(buf, "\r\n")){
         
@@ -139,6 +142,11 @@ static int forward_headers(int fd_to, request_t * request){
         else if (!strcasecmp(header_key, "Connection"));
         else if (!strcasecmp(header_key, "Proxy-Connection"));
         else{
+            if (!strcasecmp(header_key, "Accept-Encoding")){
+                if (strstr(header_val, "gzip")){
+                    request->enable_compression = 1;
+                }
+            }
             Rio_writen(fd_to, buf, strlen(buf));
         }
         if (Rio_readlineb(&(request->request_rio), buf, MAXLINE) <= 0) return -1;
@@ -157,32 +165,125 @@ static int forward_headers(int fd_to, request_t * request){
 
 }
 static void forward_response(int fd_from, int fd_to, request_t * request){
-    rio_t rio_from;
-    char buf_from[MAXLINE];
-    int length;
+    response_t response;
+    response_header_t headers;
+    response.raw_body_length = 0;
+    response.compressed_body_length = 0;
+    response.headers.num_headers = 0;
+    response.forwarded_length = 0;
+
+    char buf_from[CHUNK];
     char cache_local[MAX_OBJECT_SIZE];
-    int obj_size = 0;
+    char header_key[MAXLINE], header_val[MAXLINE];
+    size_t raw_read = 0;
+    int flush = Z_NO_FLUSH;
+    int cur_read;
+    int cur_compressed;
 
-    Rio_readinitb(&rio_from, fd_from);
-    
-    while ((length = Rio_readnb(&rio_from, buf_from, MAXLINE)) > 0){
-        
-        if (obj_size <= MAX_OBJECT_SIZE){
-            memcpy(cache_local + obj_size, buf_from, length);
-            obj_size += length;
+    if (request->enable_compression == 1){
+        response.request_compression = 1;
+    }
+    else{
+        response.request_compression = 0;
         }
-        Rio_writen(fd_to, buf_from, length);
-    }
 
-    if (obj_size <= MAX_OBJECT_SIZE) {
+    Rio_readinitb(&(response.response_rio), fd_from);
+    while (Rio_readlineb(&(response.response_rio), buf_from, CHUNK) > 0){
+        if (strcmp(buf_from, "\r\n") == 0 || response.headers.num_headers == MAX_HEADERS - 1){
+            break;
+        }
 
-        write_cache(request, cache_local, obj_size);
+        sscanf(buf_from, "%[^:]: %s\r\n", header_key, header_val);     
+        
+        if (!strcasecmp(header_key, "Content-Encoding")){
+            if (strstr(header_val, "gzip")){
+                
+                response.request_compression = 0;
+            }
+        }
+        if (!strcasecmp(header_key, "Content-length")){
+            response.raw_body_length = atoi(header_val);
+            response.headers.length_header_index = response.headers.num_headers;
+        }
+        cur_read = strlen(buf_from);
+        
+        memcpy(response.headers.headers[response.headers.num_headers], buf_from, cur_read);
+
+        response.headers.num_headers++;
         
     }
+    
+    if (response.request_compression == 1){
+        
+        if (gzip_init(&(response.strm)) != Z_OK){
+            response.request_compression = 0;
+            forward_and_cache_response_headers(&response, cache_local, fd_to);
+        }
+    }
+    else{
+        forward_and_cache_response_headers(&response, cache_local, fd_to);
+    }
+
+
+
+    
+    while ((cur_read = Rio_readnb(&(response.response_rio), buf_from, CHUNK)) > 0){
+
+        raw_read += cur_read;
+        if (raw_read == response.raw_body_length){
+            flush = Z_FINISH;
+        }
+        if (response.request_compression == 1){
+            gzip_compress_buf_init(&(response.strm), cur_read, buf_from);
+            do{
+                cur_compressed = gzip_compress(&(response.strm), response.compressed_body + response.compressed_body_length, flush);
+                response.compressed_body_length += cur_compressed;
+            }while (response.strm.avail_out == 0);
+            assert (response.strm.avail_in == 0);
+        }
+        else{
+            forward_and_cache_bytes(buf_from, cur_read, fd_to, &(response.forwarded_length), cache_local);
+        }
+        
+        
+    }
+    if (response.request_compression == 1){
+        
+        sprintf(response.headers.headers[response.headers.length_header_index], "Content-length: %ld\r\n",response.compressed_body_length);
+        forward_and_cache_response_headers(&response, cache_local, fd_to);
+        forward_and_cache_bytes(response.compressed_body, response.compressed_body_length, fd_to, &(response.forwarded_length), cache_local);
+        deflateEnd(&(response.strm));
+    }
+
+    if (response.forwarded_length <= MAX_OBJECT_SIZE) {
+        
+        write_cache(request, cache_local, response.forwarded_length);
+        
+    }
+    printf("wrote to cache\n");
     return;
 }
+static void forward_and_cache_bytes(char * buffer, size_t size, int fd_to, size_t * size_forwarded, char * cache_local){
+    Rio_writen(fd_to, buffer, size);
+    if ((* size_forwarded) <= MAX_OBJECT_SIZE){
+        memcpy(cache_local + (*size_forwarded), buffer, size);
+        (* size_forwarded) += size;
+    }
+}
 
-
+static void forward_and_cache_response_headers(response_t * response, char * cache_local, int fd_to){
+    int header_length;
+    for (int i = 0; i < response->headers.num_headers; i++){
+        header_length = strlen(response->headers.headers[i]);
+        forward_and_cache_bytes(response->headers.headers[i], header_length, fd_to, &(response->forwarded_length), cache_local);
+    }
+    if (response->request_compression == 1){
+        header_length = strlen("Content-Encoding: gzip\r\n");
+        forward_and_cache_bytes("Content-Encoding: gzip\r\n", header_length, fd_to, &(response->forwarded_length), cache_local);
+    }
+    header_length = strlen("\r\n");
+    forward_and_cache_bytes("\r\n", header_length, fd_to, &(response->forwarded_length), cache_local);
+}
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg) 
 {
